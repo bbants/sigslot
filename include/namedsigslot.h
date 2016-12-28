@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include <memory>
 #include <functional>
 #include <list>
@@ -12,30 +11,42 @@
 
 namespace nsNamedSigslot
 {
-	template<typename Signature, typename Mutex = std::recursive_mutex>
-	class Signal;
-	template<typename Mutex = std::recursive_mutex>
-	class Signals;
-
-	class ConnectionBase
+	class ObjectBase
 	{
 	protected:
 		std::atomic<bool> enable_ = true;
+	public:
+		virtual ~ObjectBase(){}
+		void Enable(bool enable = true){ enable_ = enable; }
+		bool Enabled(){ return enable_; }
+	};
+
+	class NamedObjectBase :
+		public ObjectBase
+	{
+	protected:
 		std::string name_;
+	public:
+		std::string Name(){ return name_; }
+	};
+
+	class ConnectionBase :
+		public NamedObjectBase
+	{
+	protected:
 		std::string sig_name_;
 	public:
-		virtual ~ConnectionBase(){}
-		void Enable(bool enable=true){enable_ = enable;}
-		bool Enabled(){return enable_;}
-		std::string Name(){ return name_; }
 		std::string SigName(){ return sig_name_; }
 	};
 
 	template<typename Signature>
-	class Connection :
+	class Connection:
 		public ConnectionBase
 	{
-		friend class Signal<Signature>;
+		template<typename Signature, typename Mutex>
+		friend class Signal;
+		template<typename Mutex>
+		friend class SignalHub;
 		std::function<Signature> slot_;
 
 		template <typename ...Params>
@@ -43,34 +54,31 @@ namespace nsNamedSigslot
 		{
 			if (!Enabled())
 				return;
-			slot_(std::forward<Params>(params)...);
+			slot_(params...);
 		}
 		template <typename ...Params>
 		void Emit(Params&&... params)
 		{
-			operator()(std::forward<Params>(params)...);
+			operator()(params...);
 		}
 	};
 
-	class SignalBase
+	class SignalBase :
+		public NamedObjectBase
 	{
-	protected:
-		std::atomic<bool> enable_ = true;
-		std::string name_;
-	public:
-		virtual ~SignalBase(){}
-		void Enable(bool enable=true){ enable_ = enable; }
-		bool Enabled(){ return enable_; }
-		std::string Name(){ return name_; }
 	};
 
-	template<typename Signature, typename Mutex>
+	template<typename Signature, typename Mutex = std::recursive_mutex>
 	class Signal :
 		public SignalBase
 	{
-		friend class Signals<Mutex>;
+		template<typename Mutex>
+		friend class SignalHub;
 		Mutex lock_;
 		std::list<std::weak_ptr<Connection<Signature>>> conns_;
+#if defined(_DEBUG) || defined(DEBUG)
+		std::map<std::string, std::weak_ptr<Connection<Signature>>> named_conns_;
+#endif
 	public:
 		template <typename ...Params>
 		void operator()(Params&&... params)
@@ -89,7 +97,7 @@ namespace nsNamedSigslot
 
 				auto conn = it->lock();
 				if (conn)
-					(*conn)(std::forward<Params>(params)...);
+					(*conn)(params...);
 				else
 					conns_.erase(it);
 
@@ -99,7 +107,7 @@ namespace nsNamedSigslot
 		template <typename ...Params>
 		void Emit(Params&&... params)
 		{
-			operator()(std::forward<Params>(params)...);
+			operator()(params...);
 		}
 		// save the return value as long as you want to keep the connection
 		auto Connect(std::function<Signature> func, std::string name = "") -> std::shared_ptr<Connection<Signature>>
@@ -109,68 +117,96 @@ namespace nsNamedSigslot
 			conn->name_ = name;
 			conn->sig_name_ = name_;
 
-			std::lock_guard<decltype(lock_)> l(lock_);
-			conns_.push_back(conn);
+			ConnectInternal(conn);
 			return conn;
 		}
 		// this is not required, you can reset conn to disconnect
-		void Disconnect(std::shared_ptr<Connection<Signature>> conn)
-		{
-			std::lock_guard<decltype(lock_)> l(lock_);
-			auto iter = std::find_if(conns_.begin(), conns_.end(), [&conn](std::weak_ptr<Connection<Signature>> l){
-				auto lconn = l.lock();
-				return (lconn == conn);
-			});
-			if (conns_.end() != iter)
-				conns_.erase(iter);
-		}
-		void DisconnectAll()
-		{
-			std::lock_guard<decltype(lock_)> l(lock_);
-			conns_.clear();
-		}
-	};
-	// a utility class to hold all connections
-	template<typename Mutex = std::recursive_mutex>
-	class Connections
-	{
-		Mutex lock_;
-		std::list<std::shared_ptr<ConnectionBase>> conns_;
-	public:
-		void Save(std::shared_ptr<ConnectionBase> conn)
+// 		void Disconnect(std::shared_ptr<Connection<Signature>> conn)
+// 		{
+// 			std::lock_guard<decltype(lock_)> l(lock_);
+// 			auto iter = std::find_if(conns_.begin(), conns_.end(), [&conn](std::weak_ptr<Connection<Signature>> l){
+// 				auto lconn = l.lock();
+// 				return (lconn == conn);
+// 			});
+// 			if (conns_.end() != iter)
+// 				conns_.erase(iter);
+// 		}
+// 		void DisconnectAll()
+// 		{
+// 			std::lock_guard<decltype(lock_)> l(lock_);
+// 			conns_.clear();
+// 		}
+	protected:
+		void ConnectInternal(std::weak_ptr<Connection<Signature>> conn)
 		{
 			std::lock_guard<decltype(lock_)> l(lock_);
 			conns_.push_back(conn);
+
+#if defined(_DEBUG) || defined(DEBUG)
+			auto conn_locked = conn.lock();
+			assert(conn_locked != nullptr);
+			auto name = conn_locked->Name();
+			if (name.size())
+			{
+				auto conn_iter = named_conns_.find(name);
+				if (conn_iter != named_conns_.end())
+				{
+					auto old_conn = conn_iter->second.lock();
+					assert(nullptr == old_conn); // an old instance is still valid
+				}
+				named_conns_[name] = conn;
+			}
+#endif
+		}
+	};
+	// a utility class to hold all connections/signals
+	template<typename Element, typename Mutex = std::recursive_mutex>
+	class ObjectContainer
+	{
+		Mutex lock_;
+		std::list<std::shared_ptr<Element>> items_;
+	public:
+		void Save(std::shared_ptr<Element> item)
+		{
+			std::lock_guard<decltype(lock_)> l(lock_);
+			items_.push_back(item);
 		}
 		void Enable(bool enable=true)
 		{
 			std::lock_guard<decltype(lock_)> l(lock_);
-			for (auto&& slot : conns_)
-				slot->Enable(enable);
+			for (auto&& item : items_)
+				item->Enable(enable);
 		}
 		template<typename Comp>
 		void EnableIf(Comp comp, bool enable=true)
 		{
 			std::lock_guard<decltype(lock_)> l(lock_);
-			for (auto&& slot : conns_)
+			for (auto&& item : items_)
 			{
-				if (comp(slot))
+				if (comp(item))
 				{
-					slot->Enable(enable);
+					item->Enable(enable);
 				}
 			}
 		}
+		// use std::shared_ptr, release the object to disconnect all
+// 		void DisconnectAll()
+// 		{
+// 			std::lock_guard<decltype(lock_)> l(lock_);
+// 			items_.clear();
+// 		}
 	};
 
-	template<typename Mutex>
-	class Signals
+	template<typename Mutex = std::recursive_mutex>
+	class SignalHub
 	{
 		Mutex lock_;
 		std::map<std::string, std::weak_ptr<SignalBase>> signals_;
+		std::map<std::string, std::list<std::weak_ptr<ConnectionBase>>>  early_conns_;
 	public:
-		Signals()
+		SignalHub()
 		{}
-		~Signals()
+		~SignalHub()
 		{
 			std::lock_guard<decltype(lock_)> l(lock_);
 			signals_.clear();
@@ -181,13 +217,28 @@ namespace nsNamedSigslot
 		sig_name : required, unique, used to bind sig-slot
 		*/
 		template<typename Signature>
-		auto AddSignal(std::string sig_name) -> std::shared_ptr<Signal<Signature>>
+		auto AddSignal(std::string sig_name) -> std::shared_ptr<Signal<Signature,Mutex>>
 		{
-			auto signal = std::make_shared<Signal<Signature>>();
+			auto signal = std::make_shared<Signal<Signature, Mutex>>();
 			signal->name_ = sig_name;
 
 			std::lock_guard<decltype(lock_)> l(lock_);
 			signals_[sig_name] = signal;
+
+			auto conn_iter = early_conns_.find(sig_name);
+			if (conn_iter != early_conns_.end())
+			{
+				auto&& conns = conn_iter->second;
+				for (auto&& conn : conns)
+				{
+					auto tmp = conn.lock();
+					if (nullptr != tmp)
+					{
+						signal->ConnectInternal(std::dynamic_pointer_cast<Connection<Signature>>(tmp));
+					}
+				}
+				early_conns_.erase(conn_iter);
+			}
 			return signal;
 		}
 
@@ -201,14 +252,39 @@ namespace nsNamedSigslot
 		{
 			std::lock_guard<decltype(lock_)> l(lock_);
 			auto sig_iter = signals_.find(sig_name);
-			if (signals_.end() == sig_iter)
-				return std::shared_ptr<Connection<Signature>>();
+			if (signals_.end() != sig_iter)
+			{
+				auto signal = sig_iter->second.lock();
+				if (nullptr != signal)
+				{
+					return std::dynamic_pointer_cast<Signal<Signature, Mutex>>(signal)->Connect(func, slot_name);
+				}
+			}
 
-			auto signal = sig_iter->second.lock();
-			if (nullptr == signal)
-				return std::shared_ptr<Connection<Signature>>();
+			// the signal is not available now, store to a weak_ptr first
+			auto conn = std::make_shared<Connection<Signature>>();
+			conn->slot_ = func;
+			conn->name_ = slot_name;
+			conn->sig_name_ = sig_name;
+			early_conns_[sig_name].push_back(conn);
+			return conn;
+		}
 
-			return std::dynamic_pointer_cast<Signal<Signature>>(signal)->Connect(func, slot_name);
+		template <typename Signature, typename ...Params>
+		void Emit(std::string sig_name, Params&&... params)
+		{
+			std::shared_ptr<SignalBase> signal = nullptr;
+			{
+				std::lock_guard<decltype(lock_)> l(lock_);
+				auto sig_iter = signals_.find(sig_name);
+				if (signals_.end() == sig_iter)
+					return;
+
+				signal = sig_iter->second.lock();
+				if (nullptr == signal)
+					return;
+			}
+			(*std::dynamic_pointer_cast<Signal<Signature, Mutex>>(signal))(params...);
 		}
 	};
 }
