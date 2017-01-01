@@ -15,8 +15,10 @@ namespace nsNamedSigslot
 	{
 	protected:
 		std::atomic<bool> enable_ = true;
+		std::function<void(void*)> deleter_;// we need to clear this before releasing a weak pointer
 	public:
 		virtual ~ObjectBase(){}
+		virtual void OnFinal(){deleter_ = nullptr;}
 		void Enable(bool enable = true){ enable_ = enable; }
 		bool Enabled(){ return enable_; }
 	};
@@ -72,14 +74,27 @@ namespace nsNamedSigslot
 	class Signal :
 		public SignalBase
 	{
+		typedef std::pair<void*, std::weak_ptr<Connection<Signature>>> WeakConnection;
 		template<typename Mutex>
 		friend class SignalHub;
 		Mutex lock_;
-		std::list<std::weak_ptr<Connection<Signature>>> conns_;
+		std::list<WeakConnection> conns_;
 #if defined(_DEBUG) || defined(DEBUG)
-		std::map<std::string, std::weak_ptr<Connection<Signature>>> named_conns_;
+		std::map<std::string, WeakConnection> named_conns_;
 #endif
 	public:
+		~Signal()
+		{
+			std::lock_guard<decltype(lock_)> l(lock_);
+			for (auto&& conn : conns_)
+			{
+				auto locked_conn = conn.second.lock();
+				if (locked_conn)
+				{// clear the callback
+					locked_conn->OnFinal();
+				}
+			}
+		}
 		template <typename ...Params>
 		void operator()(Params&&... params)
 		{
@@ -95,7 +110,7 @@ namespace nsNamedSigslot
 				auto itNext = it;
 				++itNext;
 
-				auto conn = it->lock();
+				auto conn = it->second.lock();
 				if (conn)
 					(*conn)(params...);
 				else
@@ -112,13 +127,19 @@ namespace nsNamedSigslot
 		// save the return value as long as you want to keep the connection
 		auto Connect(std::function<Signature> func, std::string name = "") -> std::shared_ptr<Connection<Signature>>
 		{
-			auto conn = std::make_shared<Connection<Signature>>();
+			auto conn = new Connection<Signature>();
 			conn->slot_ = func;
 			conn->name_ = name;
 			conn->sig_name_ = name_;
 
-			ConnectInternal(conn);
-			return conn;
+			auto result = std::shared_ptr<Connection<Signature>>(conn, [](Connection<Signature>* p)
+			{
+				if (p->deleter_)
+					p->deleter_(p);
+				delete p;
+			});
+			ConnectInternal(conn,result);
+			return result;
 		}
 		// this is not required, you can reset conn to disconnect
 // 		void Disconnect(std::shared_ptr<Connection<Signature>> conn)
@@ -137,24 +158,40 @@ namespace nsNamedSigslot
 // 			conns_.clear();
 // 		}
 	protected:
-		void ConnectInternal(std::weak_ptr<Connection<Signature>> conn)
+		void ConnectInternal(void* p, std::shared_ptr<Connection<Signature>> conn)
 		{
 			std::lock_guard<decltype(lock_)> l(lock_);
-			conns_.push_back(conn);
+			conns_.push_back(std::make_pair(p,conn));
+
+			// replace the deleter
+			auto name = conn->Name();
+			conn->deleter_ = [this, name](void* p)
+			{
+				std::lock_guard<decltype(lock_)> l(lock_);
+				auto conn_iter = std::find_if(conns_.begin(), conns_.end(), [p](WeakConnection iter) -> bool
+				{
+					return iter.first == p;
+				});
+				if (conn_iter != conns_.end())
+					conns_.erase(conn_iter);
+#if defined(_DEBUG) || defined(DEBUG)
+				if (name.size())
+				{
+					named_conns_.erase(name);
+				}
+#endif
+			};
 
 #if defined(_DEBUG) || defined(DEBUG)
-			auto conn_locked = conn.lock();
-			assert(conn_locked != nullptr);
-			auto name = conn_locked->Name();
 			if (name.size())
 			{
 				auto conn_iter = named_conns_.find(name);
 				if (conn_iter != named_conns_.end())
 				{
-					auto old_conn = conn_iter->second.lock();
+					auto old_conn = conn_iter->second.second.lock();
 					assert(nullptr == old_conn); // an old instance is still valid
 				}
-				named_conns_[name] = conn;
+				named_conns_[name] = std::make_pair(p, conn);
 			}
 #endif
 		}
@@ -200,16 +237,40 @@ namespace nsNamedSigslot
 	template<typename Mutex = std::recursive_mutex>
 	class SignalHub
 	{
+		typedef std::pair<void*, std::weak_ptr<SignalBase>> WeakSignal;
+		typedef std::pair<void*, std::weak_ptr<ConnectionBase>> WeakConnection;
 		Mutex lock_;
-		std::map<std::string, std::weak_ptr<SignalBase>> signals_;
-		std::map<std::string, std::list<std::weak_ptr<ConnectionBase>>>  early_conns_;
+		std::map<std::string, WeakSignal> signals_;
+		std::map<std::string, std::list<WeakConnection>>  early_conns_;
 	public:
 		SignalHub()
 		{}
 		~SignalHub()
 		{
 			std::lock_guard<decltype(lock_)> l(lock_);
+			for (auto&& iter : signals_)
+			{
+				auto&& item = iter.second;
+				auto locked_item = item.second.lock();
+				if (locked_item)
+				{
+					locked_item->OnFinal();
+				}
+			}
 			signals_.clear();
+			for (auto&& iter : early_conns_)
+			{
+				auto&& conns = iter.second;
+				for (auto&& item : conns)
+				{
+					auto locked_item = item.second.lock();
+					if (locked_item)
+					{
+						locked_item->OnFinal();
+					}
+				}
+			}
+			early_conns_.clear();
 		}
 
 		/*
@@ -219,27 +280,50 @@ namespace nsNamedSigslot
 		template<typename Signature>
 		auto AddSignal(std::string sig_name) -> std::shared_ptr<Signal<Signature,Mutex>>
 		{
-			auto signal = std::make_shared<Signal<Signature, Mutex>>();
+			auto signal = new Signal<Signature, Mutex>();
 			signal->name_ = sig_name;
 
-			std::lock_guard<decltype(lock_)> l(lock_);
-			signals_[sig_name] = signal;
-
-			auto conn_iter = early_conns_.find(sig_name);
-			if (conn_iter != early_conns_.end())
+			auto conns_iter = early_conns_.find(sig_name);
+			if (conns_iter != early_conns_.end())
 			{
-				auto&& conns = conn_iter->second;
+				auto&& conns = conns_iter->second;
 				for (auto&& conn : conns)
 				{
-					auto tmp = conn.lock();
+					auto p = conn.first;
+					auto tmp = conn.second.lock();
 					if (nullptr != tmp)
 					{
-						signal->ConnectInternal(std::dynamic_pointer_cast<Connection<Signature>>(tmp));
+						signal->ConnectInternal(p, std::dynamic_pointer_cast<Connection<Signature>>(tmp));
 					}
 				}
-				early_conns_.erase(conn_iter);
+				early_conns_.erase(conns_iter);
 			}
-			return signal;
+
+			signal->deleter_ = [this, sig_name](void* p)
+			{
+				std::lock_guard<decltype(lock_)> l(lock_);
+				auto sig_iter = signals_.find(sig_name);
+				if (signals_.end() != sig_iter)
+				{
+					if (p == sig_iter->second.first)
+					{
+						// we are the last one
+						signals_.erase(sig_iter);
+					}
+				}
+			};
+
+			auto result = std::shared_ptr<Signal<Signature, Mutex>>(signal, [](Signal<Signature, Mutex>* p)
+			{
+				// do not refer to this in destructor, instead, place clean logic in deleter_
+				if (p->deleter_)
+					p->deleter_(p);
+				delete p;
+			});
+
+			std::lock_guard<decltype(lock_)> l(lock_);
+			signals_[sig_name] = std::make_pair(signal,result);
+			return result;
 		}
 
 		/*
@@ -254,7 +338,7 @@ namespace nsNamedSigslot
 			auto sig_iter = signals_.find(sig_name);
 			if (signals_.end() != sig_iter)
 			{
-				auto signal = sig_iter->second.lock();
+				auto signal = sig_iter->second.second.lock();
 				if (nullptr != signal)
 				{
 					return std::dynamic_pointer_cast<Signal<Signature, Mutex>>(signal)->Connect(func, slot_name);
@@ -262,12 +346,36 @@ namespace nsNamedSigslot
 			}
 
 			// the signal is not available now, store to a weak_ptr first
-			auto conn = std::make_shared<Connection<Signature>>();
+			auto conn = new Connection<Signature>();
 			conn->slot_ = func;
 			conn->name_ = slot_name;
 			conn->sig_name_ = sig_name;
-			early_conns_[sig_name].push_back(conn);
-			return conn;
+			conn->deleter_ = [this, sig_name](void* p)
+			{
+				std::lock_guard<decltype(lock_)> l(lock_);
+				auto conns_iter = early_conns_.find(sig_name);
+				if (conns_iter != early_conns_.end())
+				{
+					auto&& conns = conns_iter->second;
+					auto conn_iter = std::find_if(conns.begin(), conns.end(), [p](WeakConnection iter) -> bool
+					{
+						return iter.first == p;
+					});
+					if (conn_iter != conns.end())
+					{
+						conns.erase(conn_iter);
+					}
+				}
+			};
+
+			auto result = std::shared_ptr<Connection<Signature>>(conn, [](Connection<Signature>* p)
+			{
+				if (p->deleter_)
+					p->deleter_(p);
+				delete p;
+			});
+			early_conns_[sig_name].push_back(std::make_pair(conn, std::weak_ptr<Connection<Signature>>(result)));
+			return result;
 		}
 
 		template <typename Signature, typename ...Params>
@@ -280,7 +388,7 @@ namespace nsNamedSigslot
 				if (signals_.end() == sig_iter)
 					return;
 
-				signal = sig_iter->second.lock();
+				signal = sig_iter->second.second.lock();
 				if (nullptr == signal)
 					return;
 			}
